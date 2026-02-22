@@ -53,6 +53,8 @@ type PreviewResult = {
   invalidRows: number;
 };
 
+type TaskSortMode = "kanban_order" | "due_asc";
+
 const initialSummary: DashboardSummary = {
   overdue: 0,
   dueToday: 0,
@@ -72,10 +74,25 @@ function sortTasks(tasks: Task[]): Task[] {
   });
 }
 
-function laneTasks(tasks: Task[], status: TaskStatus): Task[] {
+function laneTasksByOrder(tasks: Task[], status: TaskStatus): Task[] {
   return tasks
     .filter((task) => task.status === status)
     .sort((a, b) => (a.order === b.order ? b.updatedAt.localeCompare(a.updatedAt) : a.order - b.order));
+}
+
+function laneTasksForView(tasks: Task[], status: TaskStatus, sortMode: TaskSortMode): Task[] {
+  const lane = tasks.filter((task) => task.status === status);
+  if (sortMode === "due_asc") {
+    return lane.sort((a, b) => {
+      const aTime = a.dueDate ? new Date(a.dueDate).getTime() : Number.POSITIVE_INFINITY;
+      const bTime = b.dueDate ? new Date(b.dueDate).getTime() : Number.POSITIVE_INFINITY;
+      if (aTime !== bTime) {
+        return aTime - bTime;
+      }
+      return b.updatedAt.localeCompare(a.updatedAt);
+    });
+  }
+  return lane.sort((a, b) => (a.order === b.order ? b.updatedAt.localeCompare(a.updatedAt) : a.order - b.order));
 }
 
 function formatDate(value: string | null): string {
@@ -89,7 +106,45 @@ function toDateInput(value: string | null): string {
   if (!value) {
     return "";
   }
-  return new Date(value).toISOString().slice(0, 10);
+  const direct = value.match(/^\d{4}-\d{2}-\d{2}/);
+  if (direct) {
+    return direct[0];
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function dateKey(value: Date): string {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function startOfMonth(value: Date): Date {
+  return new Date(value.getFullYear(), value.getMonth(), 1);
+}
+
+function shiftMonth(value: Date, delta: number): Date {
+  return new Date(value.getFullYear(), value.getMonth() + delta, 1);
+}
+
+function buildCalendarDays(month: Date): Array<{ key: string; inMonth: boolean }> {
+  const first = startOfMonth(month);
+  const start = new Date(first);
+  start.setDate(first.getDate() - first.getDay());
+
+  return Array.from({ length: 42 }, (_, index) => {
+    const day = new Date(start);
+    day.setDate(start.getDate() + index);
+    return { key: dateKey(day), inMonth: day.getMonth() === month.getMonth() };
+  });
 }
 
 function priorityClass(priority: Task["priority"]): string {
@@ -135,11 +190,11 @@ function applyLocalReorder(tasks: Task[], movedTaskId: string, toStatus: TaskSta
 
   const byId = new Map(next.map((task) => [task.id, task]));
   const lanes: Record<TaskStatus, string[]> = {
-    todo: laneTasks(next, "todo").map((task) => task.id),
-    in_progress: laneTasks(next, "in_progress").map((task) => task.id),
-    blocked: laneTasks(next, "blocked").map((task) => task.id),
-    parking_lot: laneTasks(next, "parking_lot").map((task) => task.id),
-    done: laneTasks(next, "done").map((task) => task.id)
+    todo: laneTasksByOrder(next, "todo").map((task) => task.id),
+    in_progress: laneTasksByOrder(next, "in_progress").map((task) => task.id),
+    blocked: laneTasksByOrder(next, "blocked").map((task) => task.id),
+    parking_lot: laneTasksByOrder(next, "parking_lot").map((task) => task.id),
+    done: laneTasksByOrder(next, "done").map((task) => task.id)
   };
 
   for (const status of Object.keys(lanes) as TaskStatus[]) {
@@ -177,11 +232,14 @@ export function Dashboard() {
   const [taskRecurrence, setTaskRecurrence] = useState<Recurrence>("none");
   const [taskDueDate, setTaskDueDate] = useState("");
   const [newTaskProjectId, setNewTaskProjectId] = useState("");
+  const [taskSortMode, setTaskSortMode] = useState<TaskSortMode>("kanban_order");
+  const [taskProjectFilter, setTaskProjectFilter] = useState<string>("all");
 
   const [selectedProjectFeedId, setSelectedProjectFeedId] = useState("");
   const [selectedTaskFeedId, setSelectedTaskFeedId] = useState("");
   const [expandedProjectId, setExpandedProjectId] = useState<string | null>(null);
   const [activeTaskModalId, setActiveTaskModalId] = useState<string | null>(null);
+  const [taskCalendarMonth, setTaskCalendarMonth] = useState<Date>(() => startOfMonth(new Date()));
   const [projectFeedEntries, setProjectFeedEntries] = useState<ContentEntry[]>([]);
   const [taskFeedEntries, setTaskFeedEntries] = useState<ContentEntry[]>([]);
 
@@ -311,6 +369,29 @@ export function Dashboard() {
   const sortedTasks = useMemo(() => sortTasks(tasks), [tasks]);
   const projectById = useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects]);
   const activeTask = useMemo(() => sortedTasks.find((task) => task.id === activeTaskModalId) ?? null, [activeTaskModalId, sortedTasks]);
+  const visibleTasks = useMemo(
+    () => (taskProjectFilter === "all" ? sortedTasks : sortedTasks.filter((task) => task.projectId === taskProjectFilter)),
+    [sortedTasks, taskProjectFilter]
+  );
+  const canDragBoard = !mobileMode && taskSortMode === "kanban_order" && taskProjectFilter === "all";
+  const activeTaskDueDateKey = activeTask ? toDateInput(activeTask.dueDate) : "";
+  const calendarDays = useMemo(() => buildCalendarDays(taskCalendarMonth), [taskCalendarMonth]);
+  const todayKey = dateKey(new Date());
+
+  useEffect(() => {
+    if (!activeTask) {
+      return;
+    }
+    const selected = toDateInput(activeTask.dueDate);
+    if (selected) {
+      const local = new Date(`${selected}T00:00:00`);
+      if (!Number.isNaN(local.getTime())) {
+        setTaskCalendarMonth(startOfMonth(local));
+        return;
+      }
+    }
+    setTaskCalendarMonth(startOfMonth(new Date()));
+  }, [activeTask?.id, activeTask?.dueDate]);
 
   function openProjectContext(projectId: string) {
     setSelectedProjectFeedId(projectId);
@@ -709,11 +790,11 @@ export function Dashboard() {
   }
 
   async function handleDrop(toStatus: TaskStatus, beforeId: string | null) {
-    if (!draggedTaskId) {
+    if (!draggedTaskId || !canDragBoard) {
       return;
     }
 
-    const laneIds = laneTasks(tasks, toStatus)
+    const laneIds = laneTasksByOrder(tasks, toStatus)
       .filter((task) => task.id !== draggedTaskId)
       .map((task) => task.id);
 
@@ -782,6 +863,21 @@ export function Dashboard() {
         </div>
 
         <h2>Task Board</h2>
+        <div className="task-board-controls">
+          <select value={taskSortMode} onChange={(event) => setTaskSortMode(event.target.value as TaskSortMode)}>
+            <option value="kanban_order">Sort: manual board order</option>
+            <option value="due_asc">Sort: due date (soonest first)</option>
+          </select>
+          <select value={taskProjectFilter} onChange={(event) => setTaskProjectFilter(event.target.value)}>
+            <option value="all">Project: all</option>
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                Project: {project.title}
+              </option>
+            ))}
+          </select>
+        </div>
+        {!canDragBoard ? <p className="info-text">Drag and drop is disabled while sorting by due date or filtering by project.</p> : null}
         <form className="inline-form" onSubmit={handleCreateTask}>
           <input value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} placeholder="New task title" />
           <select value={taskPriority} onChange={(event) => setTaskPriority(event.target.value)}>
@@ -808,20 +904,20 @@ export function Dashboard() {
 
         <div className="kanban-board">
           {taskColumns.map((column) => {
-            const columnTasks = laneTasks(sortedTasks, column.status);
+            const columnTasks = laneTasksForView(visibleTasks, column.status, taskSortMode);
             return (
               <article
                 key={column.status}
                 className={`kanban-lane ${dropTarget?.status === column.status ? "lane-active" : ""}`}
                 onDragOver={(event) => {
-                  if (mobileMode) {
+                  if (!canDragBoard) {
                     return;
                   }
                   event.preventDefault();
                   setDropTarget({ status: column.status, beforeId: null });
                 }}
                 onDrop={(event) => {
-                  if (mobileMode) {
+                  if (!canDragBoard) {
                     return;
                   }
                   event.preventDefault();
@@ -842,21 +938,21 @@ export function Dashboard() {
                         key={task.id}
                         className={`task-card ${highlight ? "card-drop" : ""}`}
                         style={{ "--project-accent": projectColor } as CSSProperties}
-                        draggable={!mobileMode}
+                        draggable={canDragBoard}
                         onDragStart={() => setDraggedTaskId(task.id)}
                         onDragEnd={() => {
                           setDraggedTaskId(null);
                           setDropTarget(null);
                         }}
                         onDragOver={(event) => {
-                          if (mobileMode) {
+                          if (!canDragBoard) {
                             return;
                           }
                           event.preventDefault();
                           setDropTarget({ status: column.status, beforeId: task.id });
                         }}
                         onDrop={(event) => {
-                          if (mobileMode) {
+                          if (!canDragBoard) {
                             return;
                           }
                           event.preventDefault();
@@ -864,16 +960,18 @@ export function Dashboard() {
                         }}
                       >
                         <div className="card-head">
-                          <button
-                            type="button"
-                            className="task-title-link"
-                            onClick={() => {
-                              openTaskContext(task.id);
-                            }}
-                          >
-                            {task.title}
-                          </button>
-                          <span className={`priority-chip ${priorityClass(task.priority)}`}>{task.priority}</span>
+                          <div className="task-title-row">
+                            <span className={`priority-dot ${priorityClass(task.priority)}`} title={task.priority} aria-label={`priority ${task.priority}`} />
+                            <button
+                              type="button"
+                              className="task-title-link"
+                              onClick={() => {
+                                openTaskContext(task.id);
+                              }}
+                            >
+                              {task.title}
+                            </button>
+                          </div>
                         </div>
                         <div className="project-row-inline">
                           <button
@@ -997,7 +1095,12 @@ export function Dashboard() {
             <div className="task-modal-head">
               <div>
                 <p className="content-type">Task</p>
-                <h3>{activeTask.title}</h3>
+                <div className="task-modal-title-row">
+                  <h3>{activeTask.title}</h3>
+                  <button type="button" onClick={() => void handleRenameTask(activeTask)}>
+                    Rename
+                  </button>
+                </div>
               </div>
               <button
                 type="button"
@@ -1035,14 +1138,63 @@ export function Dashboard() {
                 <option value="daily">daily</option>
                 <option value="weekly">weekly</option>
               </select>
-              <input type="date" value={toDateInput(activeTask.dueDate)} onChange={(event) => void handleTaskDueDate(activeTask.id, event.target.value)} />
-              <button type="button" onClick={() => void handleRenameTask(activeTask)}>
-                Rename
-              </button>
               <button type="button" onClick={() => void handleDelete(`/api/tasks/${activeTask.id}`, `task ${activeTask.title}`)}>
                 Delete
               </button>
             </div>
+
+            <section className="task-calendar">
+              <div className="task-calendar-head">
+                <p className="field-label">Due Date Calendar</p>
+                <div className="task-calendar-nav">
+                  <button type="button" onClick={() => setTaskCalendarMonth((current) => shiftMonth(current, -1))}>
+                    Prev
+                  </button>
+                  <strong>{taskCalendarMonth.toLocaleDateString("en-US", { month: "long", year: "numeric" })}</strong>
+                  <button type="button" onClick={() => setTaskCalendarMonth((current) => shiftMonth(current, 1))}>
+                    Next
+                  </button>
+                  <button type="button" onClick={() => void handleTaskDueDate(activeTask.id, "")}>
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <div className="task-calendar-weekdays">
+                <span>Sun</span>
+                <span>Mon</span>
+                <span>Tue</span>
+                <span>Wed</span>
+                <span>Thu</span>
+                <span>Fri</span>
+                <span>Sat</span>
+              </div>
+              <div className="task-calendar-grid">
+                {calendarDays.map((day) => {
+                  const dayNum = Number(day.key.slice(8, 10));
+                  const classes = [
+                    "task-calendar-day",
+                    day.inMonth ? "" : "calendar-day-muted",
+                    day.key === activeTaskDueDateKey ? "calendar-day-selected" : "",
+                    day.key === todayKey ? "calendar-day-today" : ""
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
+
+                  return (
+                    <button
+                      key={day.key}
+                      type="button"
+                      className={classes}
+                      onClick={() => {
+                        void handleTaskDueDate(activeTask.id, day.key);
+                      }}
+                    >
+                      {dayNum}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
 
             <textarea rows={3} value={taskText} onChange={(event) => setTaskText(event.target.value)} placeholder="Add text" />
             <button type="button" onClick={() => void addTaskText()}>
